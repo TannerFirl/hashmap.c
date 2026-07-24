@@ -90,6 +90,23 @@ static void *bucket_item(struct bucket *entry) {
     return ((char*)entry)+sizeof(struct bucket);
 }
 
+// bucket_copy copies a single bucket's worth of bytes (header + element) from
+// src to dst. This is on the hot path for every set/delete/resize operation
+// (robin-hood displacement and tail-shift both copy whole buckets). bucketsz
+// is always rounded up to a multiple of sizeof(uintptr_t) when the map is
+// created, and every bucket lives at buckets + i*bucketsz, so both dst and
+// src are guaranteed to be uintptr_t-aligned here. Copying in word-sized
+// chunks avoids the call/size-dispatch overhead of a generic memcpy() for
+// these very small, fixed-per-map copies.
+static inline void bucket_copy(void *dst, const void *src, size_t bucketsz) {
+    uintptr_t *d = dst;
+    const uintptr_t *s = src;
+    size_t n = bucketsz / sizeof(uintptr_t);
+    while (n--) {
+        *d++ = *s++;
+    }
+}
+
 static uint64_t clip_hash(uint64_t hash) {
     return hash & 0xFFFFFFFFFFFF;
 }
@@ -238,13 +255,13 @@ static bool resize0(struct hashmap *map, size_t new_cap) {
         while(1) {
             struct bucket *bucket = bucket_at(map2, j);
             if (bucket->dib == 0) {
-                memcpy(bucket, entry, map->bucketsz);
+                bucket_copy(bucket, entry, map->bucketsz);
                 break;
             }
             if (bucket->dib < entry->dib) {
-                memcpy(map2->spare, bucket, map->bucketsz);
-                memcpy(bucket, entry, map->bucketsz);
-                memcpy(entry, map2->spare, map->bucketsz);
+                bucket_copy(map2->spare, bucket, map->bucketsz);
+                bucket_copy(bucket, entry, map->bucketsz);
+                bucket_copy(entry, map2->spare, map->bucketsz);
             }
             j = (j + 1) & map2->mask;
             entry->dib += 1;
@@ -290,7 +307,7 @@ const void *hashmap_set_with_hash(struct hashmap *map, const void *item,
     while(1) {
         struct bucket *bucket = bucket_at(map, i);
         if (bucket->dib == 0) {
-            memcpy(bucket, entry, map->bucketsz);
+            bucket_copy(bucket, entry, map->bucketsz);
             map->count++;
             return NULL;
         }
@@ -303,9 +320,9 @@ const void *hashmap_set_with_hash(struct hashmap *map, const void *item,
             return map->spare;
         }
         if (bucket->dib < entry->dib) {
-            memcpy(map->spare, bucket, map->bucketsz);
-            memcpy(bucket, entry, map->bucketsz);
-            memcpy(entry, map->spare, map->bucketsz);
+            bucket_copy(map->spare, bucket, map->bucketsz);
+            bucket_copy(bucket, entry, map->bucketsz);
+            bucket_copy(entry, map->spare, map->bucketsz);
             eitem = bucket_item(entry);
         }
         i = (i + 1) & map->mask;
@@ -388,7 +405,7 @@ const void *hashmap_delete_with_hash(struct hashmap *map, const void *key,
                     prev->dib = 0;
                     break;
                 }
-                memcpy(prev, bucket, map->bucketsz);
+                bucket_copy(prev, bucket, map->bucketsz);
                 prev->dib--;
             }
             map->count--;
